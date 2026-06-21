@@ -1,2 +1,5 @@
 # Telegram Bot API Token for Video Downloader Bot
 TELEGRAM_BOT_TOKEN=your_video_downloader_bot_token_here
+
+# Optional: Public URL for deployment webhooks (e.g. https://yourusername.pythonanywhere.com)
+WEBHOOK_URL=

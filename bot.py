@@ -51,8 +51,8 @@ def webhook():
     else:
         return 'Forbidden', 403
 
-# Automatically set webhook if RENDER_EXTERNAL_URL is available
-public_url = os.getenv("RENDER_EXTERNAL_URL")
+# Automatically set webhook if WEBHOOK_URL or RENDER_EXTERNAL_URL is available
+public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 if public_url:
     logger.info(f"Setting webhook to {public_url}/webhook...")
     bot.remove_webhook()
