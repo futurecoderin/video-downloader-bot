@@ -1,0 +1,2 @@
+# Telegram Bot API Token for Video Downloader Bot
+TELEGRAM_BOT_TOKEN=your_video_downloader_bot_token_here
