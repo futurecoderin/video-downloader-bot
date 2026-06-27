@@ -1,0 +1,7 @@
+services:
+  video_downloader:
+    build: .
+    container_name: video_downloader
+    restart: always
+    volumes:
+      - ./downloads:/app/downloads
