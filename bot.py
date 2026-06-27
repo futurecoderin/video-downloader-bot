@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import logging
+import shutil
 import threading
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -102,32 +103,80 @@ def analyze_video_link(chat_id, message_id, url):
         title = info.get('title', 'Video')
         formats = info.get('formats', [])
         
-        # Filter formats:
-        # 1. Must contain both video and audio (since ffmpeg is not available to merge separate streams)
-        # 2. Must be estimated under 50MB (Telegram bot limit)
+        # Check if ffmpeg is available
+        ffmpeg_available = shutil.which("ffmpeg") is not None
+        logger.info(f"ffmpeg available: {ffmpeg_available}")
+
+        # Find best audio-only format for merging if ffmpeg is available
+        best_audio = None
+        if ffmpeg_available:
+            audio_formats = [
+                f for f in formats 
+                if f.get('vcodec') == 'none' and f.get('acodec') and f.get('acodec') != 'none'
+            ]
+            if audio_formats:
+                # Sort by audio bitrate or filesize descending
+                audio_formats.sort(
+                    key=lambda x: x.get('abr') or x.get('filesize') or x.get('filesize_approx') or 0, 
+                    reverse=True
+                )
+                best_audio = audio_formats[0]
+
         valid_formats = []
-        seen_res = set() # To keep list clean, group by resolution and extension
+        seen_res = set()
 
         for f in formats:
             vcodec = f.get('vcodec')
             acodec = f.get('acodec')
             
-            # Pre-merged format has both codecs populated and they are not 'none'
-            if vcodec and vcodec != 'none' and acodec and acodec != 'none':
+            # Check if pre-merged or video-only (requiring merging)
+            is_pre_merged = vcodec and vcodec != 'none' and acodec and acodec != 'none'
+            is_video_only = vcodec and vcodec != 'none' and (not acodec or acodec == 'none')
+            
+            if is_pre_merged or (is_video_only and best_audio):
                 # File size calculation
-                filesize = f.get('filesize') or f.get('filesize_approx')
-                if filesize and filesize > 50 * 1024 * 1024:
+                f_size = f.get('filesize') or f.get('filesize_approx') or 0
+                if is_video_only:
+                    a_size = best_audio.get('filesize') or best_audio.get('filesize_approx') or 0
+                    total_size = f_size + a_size
+                else:
+                    total_size = f_size
+
+                if total_size > 50 * 1024 * 1024:
                     # Exceeds 50MB Telegram Bot API limit
                     continue
                 
-                res = f.get('resolution') or f"{f.get('height', 'unknown')}p"
-                ext = f.get('ext', 'mp4')
+                # Height and resolution
+                height = f.get('height')
+                res = f.get('resolution')
+                if not res:
+                    if height:
+                        res = f"{height}p"
+                    else:
+                        res = "unknown"
                 
-                # Check for uniqueness of resolution + extension to keep layout clean
+                # Normalize resolution format (e.g. "1920x1080" -> "1080p")
+                if "x" in res:
+                    res = res.split("x")[1] + "p"
+                
+                ext = f.get('ext', 'mp4')
                 res_key = f"{res}_{ext}"
+                
                 if res_key not in seen_res:
                     seen_res.add(res_key)
-                    valid_formats.append(f)
+                    
+                    format_id = f['format_id']
+                    if is_video_only:
+                        format_id = f"{f['format_id']}+{best_audio['format_id']}"
+                        
+                    valid_formats.append({
+                        'format_id': format_id,
+                        'resolution': res,
+                        'ext': ext,
+                        'filesize': total_size if total_size > 0 else None,
+                        'filesize_approx': total_size if total_size > 0 else None,
+                        'height': height or 0
+                    })
 
         if not valid_formats:
             bot.edit_message_text(
@@ -153,8 +202,8 @@ def analyze_video_link(chat_id, message_id, url):
         keyboard = InlineKeyboardMarkup()
         for f in valid_formats:
             format_id = f['format_id']
-            res = f.get('resolution') or f"{f.get('height', 'unknown')}p"
-            ext = f.get('ext', 'mp4')
+            res = f['resolution']
+            ext = f['ext']
             filesize = f.get('filesize') or f.get('filesize_approx')
             
             if filesize:
@@ -242,6 +291,7 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
+            'merge_output_format': 'mp4',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
