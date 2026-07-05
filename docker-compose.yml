@@ -3,5 +3,8 @@ services:
     build: .
     container_name: video_downloader
     restart: always
+    environment:
+      - GOOGLE_SPREADSHEET_ID=1JewhEUv237NZihRPc0bIXQUyT2cvHn71FvgNb0vWH7g
     volumes:
       - ./downloads:/app/downloads
+      - ./google_credentials.json:/app/google_credentials.json:ro

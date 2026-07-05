@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
+import sheets_logger
 
 # Load environment variables
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +43,7 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -69,158 +71,136 @@ URL_REGEX = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[^\s]*'
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "🎬 **Welcome to Video Downloader Bot!**\n\n"
-        "I can download publicly available videos from platforms like YouTube, Facebook, Twitter/X, and more!\n\n"
-        "👉 **How to use:**\n"
-        "Just send or paste any video link here. I will extract the available formats and let you choose your preferred download size!\n\n"
-        "⚠️ *Note: Due to Telegram limits, only formats under 50MB can be sent.*"
+        "🎬 *Welcome to Video Downloader Bot!*\n\n"
+        "I can download publicly available videos from platforms like YouTube, Instagram, "
+        "X (Twitter), TikTok, Facebook, and more!\n\n"
+        "👉 *How to use:*\n"
+        "Just send or paste any public video link. I'll extract available qualities "
+        "so you can choose your preferred download size!\n\n"
+        "⚠️ _Note: Due to Telegram limits, only files under 50 MB can be sent._\n\n"
+        "🔗 _Developed & maintained by_ [abhishekvigyan.com](https://abhishekvigyan.com)"
     )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+    bot.reply_to(message, welcome_text, parse_mode="Markdown", disable_web_page_preview=True)
+    sheets_logger.log_video_downloader(message.from_user, "/start or /help", "", "OK")
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     urls = re.findall(URL_REGEX, message.text)
     if not urls:
-        bot.reply_to(message, "👋 Send me a video link (e.g. YouTube, Facebook, X) to download it!")
+        bot.reply_to(message, "👋 Send me a video link (e.g. YouTube, Instagram, X) to download it!")
         return
 
     url = urls[0]
     status_msg = bot.reply_to(message, "🔍 Analyzing link... Please wait.")
-
+    # Log URL received
+    sheets_logger.log_video_downloader(message.from_user, "URL Received", url, "Analyzing")
     # Run analysis in a thread to keep bot responsive
-    threading.Thread(target=analyze_video_link, args=(message.chat.id, status_msg.message_id, url)).start()
+    threading.Thread(target=analyze_video_link, args=(message.chat.id, status_msg.message_id, url, message.from_user)).start()
 
-def analyze_video_link(chat_id, message_id, url):
+# yt-dlp format selector strings (stored in session, short key used in callback_data)
+# These leverage yt-dlp's built-in format resolution instead of manual filtering.
+FORMAT_OPTIONS = [
+    {
+        'key': 'q_best',
+        'label': '🏆 Best Quality',
+        'ydl_format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        'height': 9999,
+    },
+    {
+        'key': 'q_720',
+        'label': '📺 720p HD',
+        'ydl_format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        'height': 720,
+    },
+    {
+        'key': 'q_480',
+        'label': '📱 480p',
+        'ydl_format': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best',
+        'height': 480,
+    },
+    {
+        'key': 'q_360',
+        'label': '📷 360p',
+        'ydl_format': 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best',
+        'height': 360,
+    },
+]
+
+def analyze_video_link(chat_id, message_id, url, from_user=None):
     try:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'no_playlist': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'android', 'web'],
+                }
+            },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
         title = info.get('title', 'Video')
-        formats = info.get('formats', [])
-        
-        # Check if ffmpeg is available
+        duration = info.get('duration') or 0  # seconds
+        logger.info(f"Video: {title}, duration: {duration}s")
+
         ffmpeg_available = shutil.which("ffmpeg") is not None
         logger.info(f"ffmpeg available: {ffmpeg_available}")
 
-        # Find best audio-only format for merging if ffmpeg is available
-        best_audio = None
-        if ffmpeg_available:
-            audio_formats = [
-                f for f in formats 
-                if f.get('vcodec') == 'none' and f.get('acodec') and f.get('acodec') != 'none'
-            ]
-            if audio_formats:
-                # Sort by audio bitrate or filesize descending
-                audio_formats.sort(
-                    key=lambda x: x.get('abr') or x.get('filesize') or x.get('filesize_approx') or 0, 
-                    reverse=True
-                )
-                best_audio = audio_formats[0]
+        # Build quality options — estimate sizes based on duration
+        # Rough bitrate estimates: 720p~2.5Mbps, 480p~1.2Mbps, 360p~0.7Mbps total
+        BITRATE = {9999: 4_000_000, 720: 2_500_000, 480: 1_200_000, 360: 700_000}  # bits/sec
+        MAX_BYTES = 49 * 1024 * 1024  # 49MB safe limit
 
-        valid_formats = []
-        seen_res = set()
+        valid_options = []
+        for opt in FORMAT_OPTIONS:
+            bps = BITRATE.get(opt['height'], 2_000_000)
+            est_bytes = int(duration * bps / 8) if duration else 0
+            # Skip options we're CERTAIN exceed 49MB
+            if est_bytes > 0 and est_bytes > MAX_BYTES:
+                logger.info(f"Skipping {opt['label']}: estimated {est_bytes/1024/1024:.1f}MB > 49MB")
+                continue
+            # Skip high-res options if ffmpeg not available (can't merge streams)
+            if not ffmpeg_available and opt['height'] > 360:
+                continue
+            valid_options.append(opt)
 
-        for f in formats:
-            vcodec = f.get('vcodec')
-            acodec = f.get('acodec')
-            
-            # Check if pre-merged or video-only (requiring merging)
-            is_pre_merged = vcodec and vcodec != 'none' and acodec and acodec != 'none'
-            is_video_only = vcodec and vcodec != 'none' and (not acodec or acodec == 'none')
-            
-            if is_pre_merged or (is_video_only and best_audio):
-                # File size calculation
-                f_size = f.get('filesize') or f.get('filesize_approx') or 0
-                if is_video_only:
-                    a_size = best_audio.get('filesize') or best_audio.get('filesize_approx') or 0
-                    total_size = f_size + a_size
-                else:
-                    total_size = f_size
-
-                if total_size > 50 * 1024 * 1024:
-                    # Exceeds 50MB Telegram Bot API limit
-                    continue
-                
-                # Height and resolution
-                height = f.get('height')
-                res = f.get('resolution')
-                if not res:
-                    if height:
-                        res = f"{height}p"
-                    else:
-                        res = "unknown"
-                
-                # Normalize resolution format (e.g. "1920x1080" -> "1080p")
-                if "x" in res:
-                    res = res.split("x")[1] + "p"
-                
-                ext = f.get('ext', 'mp4')
-                res_key = f"{res}_{ext}"
-                
-                if res_key not in seen_res:
-                    seen_res.add(res_key)
-                    
-                    format_id = f['format_id']
-                    if is_video_only:
-                        format_id = f"{f['format_id']}+{best_audio['format_id']}"
-                        
-                    valid_formats.append({
-                        'format_id': format_id,
-                        'resolution': res,
-                        'ext': ext,
-                        'filesize': total_size if total_size > 0 else None,
-                        'filesize_approx': total_size if total_size > 0 else None,
-                        'height': height or 0
-                    })
-
-        if not valid_formats:
-            bot.edit_message_text(
-                "❌ **Error:** No compatible formats under 50MB containing both video and audio could be found for this link.",
-                chat_id=chat_id,
-                message_id=message_id,
-                parse_mode="Markdown"
-            )
-            return
-
-        # Sort by resolution height (descending quality)
-        valid_formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
+        # Always keep at least 360p as last resort even for long videos
+        if not valid_options:
+            valid_options = [FORMAT_OPTIONS[-1]]  # 360p fallback
 
         # Create session ID
         session_id = str(uuid.uuid4())[:8]
         download_sessions[session_id] = {
             'url': url,
             'title': title,
-            'formats': {f['format_id']: f for f in valid_formats}
+            'duration': duration,
+            'formats': {opt['key']: opt for opt in valid_options},
+            'from_user': from_user,
         }
 
         # Build inline keyboard
         keyboard = InlineKeyboardMarkup()
-        for f in valid_formats:
-            format_id = f['format_id']
-            res = f['resolution']
-            ext = f['ext']
-            filesize = f.get('filesize') or f.get('filesize_approx')
-            
-            if filesize:
-                size_mb = filesize / (1024 * 1024)
-                size_str = f"{size_mb:.1f} MB"
+        for opt in valid_options:
+            bps = BITRATE.get(opt['height'], 2_000_000)
+            est_bytes = int(duration * bps / 8) if duration else 0
+            if est_bytes > 0:
+                est_mb = est_bytes / (1024 * 1024)
+                size_str = f"~{est_mb:.0f} MB"
             else:
-                size_str = "unknown size"
-
-            btn_text = f"🎬 {res} ({ext.upper()}) - {size_str}"
-            callback_data = f"dl:{session_id}:{format_id}"
+                size_str = "size unknown"
+            btn_text = f"{opt['label']} ({size_str})"
+            callback_data = f"dl:{session_id}:{opt['key']}"
             keyboard.add(InlineKeyboardButton(text=btn_text, callback_data=callback_data))
 
-        # Send info with keyboard options
+        duration_str = f"{int(duration//60)}m {int(duration%60)}s" if duration else "unknown"
         info_text = (
             f"🎬 **Video Found:**\n"
-            f"`{title}`\n\n"
-            f"Select a size/quality to download:"
+            f"`{title}`\n"
+            f"⏱ Duration: {duration_str}\n\n"
+            f"Select quality to download:\n"
+            f"_(Telegram limit: 50MB. Large files may fail.)_"
         )
         bot.edit_message_text(
             info_text,
@@ -233,7 +213,7 @@ def analyze_video_link(chat_id, message_id, url):
     except Exception as e:
         logger.error(f"Failed to analyze link {url}: {e}")
         bot.edit_message_text(
-            f"❌ **Error:** Could not extract video information.\n\n*Details:* {str(e)[:150]}...",
+            f"❌ **Error:** Could not extract video information.\n\n*Details:* {str(e)[:200]}",
             chat_id=chat_id,
             message_id=message_id,
             parse_mode="Markdown"
@@ -241,10 +221,11 @@ def analyze_video_link(chat_id, message_id, url):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('dl:'))
 def handle_download_callback(call):
-    parts = call.data.split(':')
+    # Use maxsplit=2 so format IDs like "140+251" or those containing colons are safe
+    parts = call.data.split(':', 2)
     if len(parts) != 3:
         return
-        
+
     _, session_id, format_id = parts
     
     session = download_sessions.get(session_id)
@@ -256,6 +237,15 @@ def handle_download_callback(call):
 
     # Answer query to stop loading spinner
     bot.answer_callback_query(call.id, "Downloading started...")
+
+    # Log quality chosen
+    session = download_sessions.get(session_id)
+    if session:
+        from_user = session.get('from_user')
+        fmt = session.get('formats', {}).get(format_id, {})
+        label = fmt.get('label', format_id)
+        if from_user:
+            sheets_logger.log_video_downloader(from_user, "Quality Selected", label, "Downloading")
 
     # Start download in a thread
     threading.Thread(target=download_and_send_video, args=(call.message.chat.id, call.message.message_id, session_id, format_id)).start()
@@ -286,12 +276,21 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         # Set output template using unique session ID to identify the file
         output_template = os.path.join(downloads_dir, f"{session_id}_%(title)s.%(ext)s")
         
+        # Use ydl_format from the session option if available, otherwise use format_id directly
+        ydl_format = format_info.get('ydl_format', format_id)
+        logger.info(f"Downloading format: {ydl_format} for {url}")
+
         ydl_opts = {
-            'format': format_id,
+            'format': ydl_format,
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
             'merge_output_format': 'mp4',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'android', 'web'],
+                }
+            },
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -306,9 +305,29 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         if not downloaded_file_path or not os.path.exists(downloaded_file_path):
             raise Exception("Downloaded file not found on disk.")
 
+        # Check actual file size before attempting upload
+        actual_size = os.path.getsize(downloaded_file_path)
+        MAX_TG_SIZE = 50 * 1024 * 1024  # 50MB Telegram Bot API limit
+        if actual_size > MAX_TG_SIZE:
+            size_mb = actual_size / (1024 * 1024)
+            from_user = session.get('from_user')
+            if from_user:
+                sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Too Large ({size_mb:.1f} MB)")
+            bot.edit_message_text(
+                f"⚠️ **File Too Large for Telegram**\n"
+                f"`{title}`\n\n"
+                f"Downloaded file is **{size_mb:.1f} MB**, but Telegram's Bot API limit is 50 MB.\n"
+                f"Try a lower quality option.",
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown"
+            )
+            return
+
         # Update status before sending
+        size_mb = actual_size / (1024 * 1024)
         bot.edit_message_text(
-            f"📤 **Uploading to Telegram...**\n`{title}`",
+            f"📤 **Uploading to Telegram...**\n`{title}`\n_{size_mb:.1f} MB_",
             chat_id=chat_id,
             message_id=message_id,
             parse_mode="Markdown"
@@ -319,16 +338,24 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             bot.send_video(
                 chat_id,
                 video,
-                caption=f"🎥 **{title}**\n\nDownloaded via Video Downloader Bot",
+                caption=f"🎥 **{title}**\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com",
                 parse_mode="Markdown",
-                timeout=180 # Longer timeout for uploading video
+                timeout=180
             )
+
+        # Log success
+        from_user = session.get('from_user')
+        if from_user:
+            sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Success ({size_mb:.1f} MB)")
 
         # Delete the original status message
         bot.delete_message(chat_id, message_id)
 
     except Exception as e:
         logger.error(f"Download failed: {e}")
+        from_user = session.get('from_user') if session else None
+        if from_user:
+            sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Failed: {str(e)[:80]}")
         bot.send_message(
             chat_id,
             f"❌ **Failed to download video.**\n\n*Error:* {str(e)[:150]}...",
@@ -348,7 +375,6 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
 
 if __name__ == "__main__":
     if public_url:
-        # Run Flask development server when executing locally with RENDER_EXTERNAL_URL
         port = int(os.getenv("PORT", 8080))
         app.run(host="0.0.0.0", port=port)
     else:
@@ -356,6 +382,20 @@ if __name__ == "__main__":
         print("Bot is running in polling mode... Press Ctrl+C to stop.")
         try:
             bot.remove_webhook()
+            # Set bot About/Description now that connection is confirmed
+            try:
+                bot.set_my_description(
+                    "🎬 Download videos from YouTube, Instagram, X (Twitter), TikTok, and more!\n\n"
+                    "Just send any public video link and choose your preferred quality.\n\n"
+                    "⚠️ Files are limited to 50 MB due to Telegram Bot API restrictions.\n\n"
+                    "🔗 Developed & maintained by https://abhishekvigyan.com"
+                )
+                bot.set_my_short_description(
+                    "Download videos from YouTube & more! Developed by abhishekvigyan.com"
+                )
+                logger.info("Bot description updated successfully.")
+            except Exception as _de:
+                logger.warning(f"Could not set bot description: {_de}")
             bot.infinity_polling()
         except Exception as e:
             logger.error(f"Error occurred: {e}")

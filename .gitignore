@@ -4,3 +4,4 @@ __pycache__/
 env.txt
 .env
 *.pyc
+google_credentials.json

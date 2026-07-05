@@ -1,7 +1,11 @@
 FROM python:3.11-slim
 
-# Install ffmpeg
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg + build tools for cffi/cryptography (required by google-auth)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    gcc \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -11,7 +15,7 @@ RUN pip install --upgrade pip
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY bot.py env.txt ./
+COPY bot.py sheets_logger.py env.txt ./
 RUN mkdir -p downloads
 
 CMD ["python", "-u", "bot.py"]

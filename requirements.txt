@@ -4,3 +4,5 @@ yt-dlp
 requests
 Flask==3.0.3
 gunicorn==22.0.0
+gspread>=6.0.0
+google-auth>=2.0.0
