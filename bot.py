@@ -132,6 +132,7 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
             'quiet': True,
             'no_warnings': True,
             'no_playlist': True,
+            'socket_timeout': 30,
             'extractor_args': {
                 'youtube': {
                     'player_client': ['ios', 'android', 'web'],
@@ -285,6 +286,7 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
+            'socket_timeout': 60,
             'merge_output_format': 'mp4',
             'extractor_args': {
                 'youtube': {

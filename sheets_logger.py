@@ -12,7 +12,9 @@ If either credential is missing, logging is silently skipped and the bot runs no
 import os
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 logger = logging.getLogger(__name__)
 
@@ -103,24 +105,34 @@ def _append_async(tab_name: str, headers: list, row: list):
 # ─────────────────────────────────────────────
 
 VIDEO_DOWNLOADER_HEADERS = [
-    "Timestamp (UTC)", "User ID", "Username", "Full Name", "Language",
+    "Timestamp (IST)", "User ID", "Username", "Full Name", "Language",
     "Action", "Detail", "Status"
 ]
 
 FORWARDER_HEADERS = [
-    "Timestamp (UTC)", "User ID", "Username", "Full Name", "Language",
+    "Timestamp (IST)", "User ID", "Username", "Full Name", "Language",
     "Action", "Detail"
+]
+
+CHAR_COUNTER_HEADERS = [
+    "Timestamp (IST)", "User ID", "Username", "Full Name", "Language",
+    "Action", "Detail"
+]
+
+MOVIE_SEARCH_HEADERS = [
+    "Timestamp (IST)", "User ID", "Username", "Full Name", "Language",
+    "Action", "Detail"
+]
+
+IMAGE_DOWNLOADER_HEADERS = [
+    "Timestamp (IST)", "User ID", "Username", "Full Name", "Language",
+    "Action", "Detail", "Status"
 ]
 
 
 def log_video_downloader(user, action: str, detail: str = "", status: str = ""):
     """
     Log a Video Downloader Bot event.
-
-    user  — telebot message.from_user object
-    action — e.g. "URL Received", "Quality Selected", "Download Success"
-    detail — URL, quality name, error message, etc.
-    status — "OK", "Too Large", "Failed", etc.
     """
     username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
     full_name = " ".join(filter(None, [
@@ -128,7 +140,7 @@ def log_video_downloader(user, action: str, detail: str = "", status: str = ""):
         getattr(user, "last_name", "") or ""
     ])) or "N/A"
     row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         str(getattr(user, "id", "")),
         username,
         full_name,
@@ -143,13 +155,11 @@ def log_video_downloader(user, action: str, detail: str = "", status: str = ""):
 def log_message_forwarder(user_id, username, first_name, last_name, lang, action: str, detail: str = ""):
     """
     Log a Message Forwarder Bot event.
-
-    All user fields passed individually since Telethon uses different objects.
     """
     full_name = " ".join(filter(None, [first_name or "", last_name or ""])) or "N/A"
     uname = f"@{username}" if username else "N/A"
     row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         str(user_id),
         uname,
         full_name,
@@ -160,19 +170,9 @@ def log_message_forwarder(user_id, username, first_name, last_name, lang, action
     _append_async("Message Forwarder", FORWARDER_HEADERS, row)
 
 
-CHAR_COUNTER_HEADERS = [
-    "Timestamp (UTC)", "User ID", "Username", "Full Name", "Language",
-    "Action", "Detail"
-]
-
-
 def log_char_counter(user, action: str, detail: str = ""):
     """
     Log a Character Counter Bot event.
-
-    user   — telebot message.from_user object
-    action — e.g. "/start or /help", "Text Analyzed", "Forwarded Message", "No Text Sent"
-    detail — e.g. "chars=142, words=28, lines=3"
     """
     username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
     full_name = " ".join(filter(None, [
@@ -180,7 +180,7 @@ def log_char_counter(user, action: str, detail: str = ""):
         getattr(user, "last_name", "") or ""
     ])) or "N/A"
     row = [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         str(getattr(user, "id", "")),
         username,
         full_name,
@@ -189,3 +189,46 @@ def log_char_counter(user, action: str, detail: str = ""):
         str(detail)[:500],
     ]
     _append_async("Char Counter", CHAR_COUNTER_HEADERS, row)
+
+
+def log_movie_search(user, action: str, detail: str = ""):
+    """
+    Log a Movie Search Bot event.
+    """
+    username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
+    full_name = " ".join(filter(None, [
+        getattr(user, "first_name", ""),
+        getattr(user, "last_name", "") or ""
+    ])) or "N/A"
+    row = [
+        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        str(getattr(user, "id", "")),
+        username,
+        full_name,
+        getattr(user, "language_code", "N/A") or "N/A",
+        action,
+        str(detail)[:500],
+    ]
+    _append_async("Movie Search", MOVIE_SEARCH_HEADERS, row)
+
+
+def log_image_downloader(user, action: str, detail: str = "", status: str = ""):
+    """
+    Log an Image Downloader Bot event.
+    """
+    username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
+    full_name = " ".join(filter(None, [
+        getattr(user, "first_name", ""),
+        getattr(user, "last_name", "") or ""
+    ])) or "N/A"
+    row = [
+        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        str(getattr(user, "id", "")),
+        username,
+        full_name,
+        getattr(user, "language_code", "N/A") or "N/A",
+        action,
+        str(detail)[:500],
+        status,
+    ]
+    _append_async("Image Downloader", IMAGE_DOWNLOADER_HEADERS, row)
