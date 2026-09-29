@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
+import subprocess
 import sheets_logger
 
 # Load environment variables
@@ -126,6 +127,96 @@ FORMAT_OPTIONS = [
     },
 ]
 
+def get_video_duration(file_path):
+    """Get video duration in seconds using ffprobe."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.warning(f"Could not get video duration via ffprobe: {e}")
+        return 0.0
+
+def compress_video_to_limit(input_path, target_max_mb=47.5):
+    """
+    Compress video with FFmpeg to ensure it is strictly below target_max_mb (Telegram Bot API 50MB limit).
+    Returns path to compressed video if successful and within limits, otherwise None.
+    """
+    if not shutil.which("ffmpeg"):
+        logger.warning("ffmpeg is not installed, skipping compression")
+        return None
+
+    duration = get_video_duration(input_path)
+    if duration <= 0:
+        logger.warning("Could not determine duration for compression")
+        return None
+
+    target_bits = target_max_mb * 1024 * 1024 * 8
+    target_total_bps = target_bits / duration
+
+    # Allocate audio bitrate (48kbps - 96kbps)
+    if target_total_bps < 180_000:
+        audio_bps = 48_000
+    elif target_total_bps < 350_000:
+        audio_bps = 64_000
+    else:
+        audio_bps = 96_000
+
+    video_bps = int(target_total_bps - audio_bps)
+    if video_bps < 40_000:
+        logger.warning(f"Calculated video bitrate {video_bps} is too low to produce a watchable video")
+        return None
+
+    base, _ = os.path.splitext(input_path)
+    output_path = f"{base}_compressed.mp4"
+
+    # Scale video down if bitrate is low to maintain sharp visual quality
+    scale_filter = "scale='min(1280,iw)':-2"
+    if video_bps < 300_000:
+        scale_filter = "scale='min(640,iw)':-2"
+    elif video_bps < 600_000:
+        scale_filter = "scale='min(854,iw)':-2"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-c:v", "libx264",
+        "-b:v", str(video_bps),
+        "-maxrate", str(int(video_bps * 1.3)),
+        "-bufsize", str(int(video_bps * 2)),
+        "-vf", scale_filter,
+        "-c:a", "aac",
+        "-b:a", str(audio_bps),
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        output_path
+    ]
+
+    logger.info(f"Starting FFmpeg compression: duration={duration:.1f}s, v_bitrate={video_bps//1000}k, a_bitrate={audio_bps//1000}k")
+    try:
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        if os.path.exists(output_path):
+            comp_size = os.path.getsize(output_path)
+            logger.info(f"Compressed file created: {comp_size / (1024*1024):.2f} MB")
+            if comp_size <= target_max_mb * 1024 * 1024:
+                return output_path
+            else:
+                logger.warning(f"Compressed file still exceeded target size: {comp_size / (1024*1024):.2f} MB")
+                return output_path
+    except Exception as e:
+        logger.error(f"FFmpeg compression failed: {e}")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+    return None
+
 def analyze_video_link(chat_id, message_id, url, from_user=None):
     try:
         ydl_opts = {
@@ -152,24 +243,22 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
         # Build quality options — estimate sizes based on duration
         # Rough bitrate estimates: 720p~2.5Mbps, 480p~1.2Mbps, 360p~0.7Mbps total
         BITRATE = {9999: 4_000_000, 720: 2_500_000, 480: 1_200_000, 360: 700_000}  # bits/sec
-        MAX_BYTES = 49 * 1024 * 1024  # 49MB safe limit
+        MAX_EST_BYTES = 200 * 1024 * 1024  # Allow up to 200MB since we can auto-compress
 
         valid_options = []
         for opt in FORMAT_OPTIONS:
             bps = BITRATE.get(opt['height'], 2_000_000)
             est_bytes = int(duration * bps / 8) if duration else 0
-            # Skip options we're CERTAIN exceed 49MB
-            if est_bytes > 0 and est_bytes > MAX_BYTES:
-                logger.info(f"Skipping {opt['label']}: estimated {est_bytes/1024/1024:.1f}MB > 49MB")
+            if est_bytes > 0 and est_bytes > MAX_EST_BYTES:
+                logger.info(f"Skipping {opt['label']}: estimated {est_bytes/1024/1024:.1f}MB > 200MB")
                 continue
-            # Skip high-res options if ffmpeg not available (can't merge streams)
             if not ffmpeg_available and opt['height'] > 360:
                 continue
             valid_options.append(opt)
 
-        # Always keep at least 360p as last resort even for long videos
+        # Always keep at least 360p as fallback
         if not valid_options:
-            valid_options = [FORMAT_OPTIONS[-1]]  # 360p fallback
+            valid_options = [FORMAT_OPTIONS[-1]]
 
         # Create session ID
         session_id = str(uuid.uuid4())[:8]
@@ -201,7 +290,7 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
             f"`{title}`\n"
             f"⏱ Duration: {duration_str}\n\n"
             f"Select quality to download:\n"
-            f"_(Telegram limit: 50MB. Large files may fail.)_"
+            f"_(Videos over 50MB are automatically optimized to fit Telegram)_"
         )
         bot.edit_message_text(
             info_text,
@@ -213,8 +302,20 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
 
     except Exception as e:
         logger.error(f"Failed to analyze link {url}: {e}")
+        err_str = str(e)
+        if "HTTP Error 530" in err_str or "530" in err_str:
+            err_msg = (
+                "❌ **Video Unavailable on Host Server**\n\n"
+                "The hosting site (CDN) returned a **530 Origin Host Error**.\n"
+                "This means the video stream has been deleted, expired, or is broken on the source website's servers."
+            )
+        elif "Unsupported URL" in err_str:
+            err_msg = "❌ **Unsupported Link:** This website or link type is currently not supported."
+        else:
+            err_msg = f"❌ **Error:** Could not extract video information.\n\n*Details:* {err_str[:200]}"
+
         bot.edit_message_text(
-            f"❌ **Error:** Could not extract video information.\n\n*Details:* {str(e)[:200]}",
+            err_msg,
             chat_id=chat_id,
             message_id=message_id,
             parse_mode="Markdown"
@@ -232,7 +333,6 @@ def handle_download_callback(call):
     session = download_sessions.get(session_id)
     if not session:
         bot.answer_callback_query(call.id, "❌ Session expired! Please resend the video link.", show_alert=True)
-        # Remove buttons from message
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         return
 
@@ -240,7 +340,6 @@ def handle_download_callback(call):
     bot.answer_callback_query(call.id, "Downloading started...")
 
     # Log quality chosen
-    session = download_sessions.get(session_id)
     if session:
         from_user = session.get('from_user')
         fmt = session.get('formats', {}).get(format_id, {})
@@ -273,11 +372,9 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
     )
 
     downloaded_file_path = None
+    compressed_file_path = None
     try:
-        # Set output template using unique session ID to identify the file
         output_template = os.path.join(downloads_dir, f"{session_id}_%(title)s.%(ext)s")
-        
-        # Use ydl_format from the session option if available, otherwise use format_id directly
         ydl_format = format_info.get('ydl_format', format_id)
         logger.info(f"Downloading format: {ydl_format} for {url}")
 
@@ -300,26 +397,52 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
 
         # Scan download folder for the downloaded file
         for filename in os.listdir(downloads_dir):
-            if filename.startswith(session_id):
+            if filename.startswith(session_id) and not filename.endswith("_compressed.mp4"):
                 downloaded_file_path = os.path.join(downloads_dir, filename)
                 break
 
         if not downloaded_file_path or not os.path.exists(downloaded_file_path):
             raise Exception("Downloaded file not found on disk.")
 
-        # Check actual file size before attempting upload
         actual_size = os.path.getsize(downloaded_file_path)
-        MAX_TG_SIZE = 50 * 1024 * 1024  # 50MB Telegram Bot API limit
+        MAX_TG_SIZE = 49.5 * 1024 * 1024  # 49.5MB safe Telegram Bot API limit
+        file_to_send = downloaded_file_path
+        was_compressed = False
+
         if actual_size > MAX_TG_SIZE:
             size_mb = actual_size / (1024 * 1024)
+            logger.info(f"File is {size_mb:.1f} MB (>49.5MB). Initiating auto-compression...")
+            bot.edit_message_text(
+                f"🔄 **File is {size_mb:.1f} MB (exceeds Telegram 50 MB limit).**\n"
+                f"`{title}`\n\n"
+                f"Compressing video to fit Telegram's limit... Please wait a moment.",
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown"
+            )
+
+            compressed_file_path = compress_video_to_limit(downloaded_file_path, target_max_mb=47.5)
+            if compressed_file_path and os.path.exists(compressed_file_path):
+                comp_size = os.path.getsize(compressed_file_path)
+                if comp_size <= 49.5 * 1024 * 1024:
+                    file_to_send = compressed_file_path
+                    was_compressed = True
+                    logger.info(f"Compression successful: {comp_size / (1024*1024):.1f} MB")
+                else:
+                    logger.warning(f"Compressed file still over limit: {comp_size / (1024*1024):.1f} MB")
+
+        final_size = os.path.getsize(file_to_send)
+        final_mb = final_size / (1024 * 1024)
+
+        if final_size > 50 * 1024 * 1024:
             from_user = session.get('from_user')
             if from_user:
-                sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Too Large ({size_mb:.1f} MB)")
+                sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Too Large ({final_mb:.1f} MB)")
             bot.edit_message_text(
                 f"⚠️ **File Too Large for Telegram**\n"
                 f"`{title}`\n\n"
-                f"Downloaded file is **{size_mb:.1f} MB**, but Telegram's Bot API limit is 50 MB.\n"
-                f"Try a lower quality option.",
+                f"Downloaded video is **{final_mb:.1f} MB** and could not be compressed under Telegram's 50 MB limit.\n"
+                f"Please try selecting a lower quality option (e.g. 360p or 480p).",
                 chat_id=chat_id,
                 message_id=message_id,
                 parse_mode="Markdown"
@@ -327,28 +450,30 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             return
 
         # Update status before sending
-        size_mb = actual_size / (1024 * 1024)
         bot.edit_message_text(
-            f"📤 **Uploading to Telegram...**\n`{title}`\n_{size_mb:.1f} MB_",
+            f"📤 **Uploading to Telegram...**\n`{title}`\n_{final_mb:.1f} MB_",
             chat_id=chat_id,
             message_id=message_id,
             parse_mode="Markdown"
         )
 
+        caption_note = "\n_(Optimized for Telegram 50MB limit)_" if was_compressed else ""
+        caption_text = f"🎥 **{title}**{caption_note}\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com"
+
         # Send video file
-        with open(downloaded_file_path, 'rb') as video:
+        with open(file_to_send, 'rb') as video:
             bot.send_video(
                 chat_id,
                 video,
-                caption=f"🎥 **{title}**\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com",
+                caption=caption_text,
                 parse_mode="Markdown",
-                timeout=180
+                timeout=240
             )
 
         # Log success
         from_user = session.get('from_user')
         if from_user:
-            sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Success ({size_mb:.1f} MB)")
+            sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Success ({final_mb:.1f} MB)")
 
         # Delete the original status message
         bot.delete_message(chat_id, message_id)
@@ -364,12 +489,13 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             parse_mode="Markdown"
         )
     finally:
-        # Cleanup file from disk
-        if downloaded_file_path and os.path.exists(downloaded_file_path):
-            try:
-                os.remove(downloaded_file_path)
-            except Exception as ex:
-                logger.error(f"Failed to delete file {downloaded_file_path}: {ex}")
+        # Cleanup files from disk
+        for fpath in [downloaded_file_path, compressed_file_path]:
+            if fpath and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except Exception as ex:
+                    logger.error(f"Failed to delete file {fpath}: {ex}")
         
         # Remove session to free memory
         if session_id in download_sessions:
