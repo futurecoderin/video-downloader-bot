@@ -41,6 +41,17 @@ if not TOKEN:
     import sys
     sys.exit(0)
 
+# Support Local Telegram Bot API Server
+LOCAL_BOT_API_URL = os.getenv("LOCAL_BOT_API_URL")
+if LOCAL_BOT_API_URL:
+    telebot.apihelper.API_URL = f"{LOCAL_BOT_API_URL}/bot{{0}}/{{1}}"
+    telebot.apihelper.FILE_URL = f"{LOCAL_BOT_API_URL}/file/bot{{0}}/{{1}}"
+    logger.info(f"🚀 Using Local Telegram Bot API Server at {LOCAL_BOT_API_URL}")
+
+IS_LOCAL_SERVER = bool(LOCAL_BOT_API_URL)
+MAX_TG_BYTES = int(1950 * 1024 * 1024) if IS_LOCAL_SERVER else int(49.5 * 1024 * 1024)
+MAX_TG_MB = 1950 if IS_LOCAL_SERVER else 49.5
+
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
@@ -71,6 +82,7 @@ URL_REGEX = r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[^\s]*'
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
+    limit_note = "up to 2 GB" if IS_LOCAL_SERVER else "under 50 MB"
     welcome_text = (
         "🎬 *Welcome to Video Downloader Bot!*\n\n"
         "I can download publicly available videos from platforms like YouTube, Instagram, "
@@ -78,7 +90,7 @@ def send_welcome(message):
         "👉 *How to use:*\n"
         "Just send or paste any public video link. I'll extract available qualities "
         "so you can choose your preferred download size!\n\n"
-        "⚠️ _Note: Due to Telegram limits, only files under 50 MB can be sent._\n\n"
+        f"⚡ _Files {limit_note} can be sent in original high quality._\n\n"
         "🔗 _Developed & maintained by_ [abhishekvigyan.com](https://abhishekvigyan.com)"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown", disable_web_page_preview=True)
@@ -243,14 +255,14 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
         # Build quality options — estimate sizes based on duration
         # Rough bitrate estimates: 720p~2.5Mbps, 480p~1.2Mbps, 360p~0.7Mbps total
         BITRATE = {9999: 4_000_000, 720: 2_500_000, 480: 1_200_000, 360: 700_000}  # bits/sec
-        MAX_EST_BYTES = 200 * 1024 * 1024  # Allow up to 200MB since we can auto-compress
+        MAX_EST_BYTES = MAX_TG_BYTES
 
         valid_options = []
         for opt in FORMAT_OPTIONS:
             bps = BITRATE.get(opt['height'], 2_000_000)
             est_bytes = int(duration * bps / 8) if duration else 0
             if est_bytes > 0 and est_bytes > MAX_EST_BYTES:
-                logger.info(f"Skipping {opt['label']}: estimated {est_bytes/1024/1024:.1f}MB > 200MB")
+                logger.info(f"Skipping {opt['label']}: estimated {est_bytes/1024/1024:.1f}MB > {MAX_TG_MB}MB")
                 continue
             if not ffmpeg_available and opt['height'] > 360:
                 continue
@@ -285,12 +297,13 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
             keyboard.add(InlineKeyboardButton(text=btn_text, callback_data=callback_data))
 
         duration_str = f"{int(duration//60)}m {int(duration%60)}s" if duration else "unknown"
+        limit_desc = "up to 2 GB supported" if IS_LOCAL_SERVER else "auto-optimized under 50 MB"
         info_text = (
             f"🎬 **Video Found:**\n"
             f"`{title}`\n"
             f"⏱ Duration: {duration_str}\n\n"
             f"Select quality to download:\n"
-            f"_(Videos over 50MB are automatically optimized to fit Telegram)_"
+            f"_({limit_desc})_"
         )
         bot.edit_message_text(
             info_text,
@@ -405,15 +418,15 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             raise Exception("Downloaded file not found on disk.")
 
         actual_size = os.path.getsize(downloaded_file_path)
-        MAX_TG_SIZE = 49.5 * 1024 * 1024  # 49.5MB safe Telegram Bot API limit
         file_to_send = downloaded_file_path
         was_compressed = False
 
-        if actual_size > MAX_TG_SIZE:
+        if actual_size > MAX_TG_BYTES:
             size_mb = actual_size / (1024 * 1024)
-            logger.info(f"File is {size_mb:.1f} MB (>49.5MB). Initiating auto-compression...")
+            target_compress_mb = 1900.0 if IS_LOCAL_SERVER else 47.5
+            logger.info(f"File is {size_mb:.1f} MB (>{MAX_TG_MB}MB). Initiating auto-compression to {target_compress_mb}MB...")
             bot.edit_message_text(
-                f"🔄 **File is {size_mb:.1f} MB (exceeds Telegram 50 MB limit).**\n"
+                f"🔄 **File is {size_mb:.1f} MB (exceeds Telegram {int(MAX_TG_MB)} MB limit).**\n"
                 f"`{title}`\n\n"
                 f"Compressing video to fit Telegram's limit... Please wait a moment.",
                 chat_id=chat_id,
@@ -421,10 +434,10 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
                 parse_mode="Markdown"
             )
 
-            compressed_file_path = compress_video_to_limit(downloaded_file_path, target_max_mb=47.5)
+            compressed_file_path = compress_video_to_limit(downloaded_file_path, target_max_mb=target_compress_mb)
             if compressed_file_path and os.path.exists(compressed_file_path):
                 comp_size = os.path.getsize(compressed_file_path)
-                if comp_size <= 49.5 * 1024 * 1024:
+                if comp_size <= MAX_TG_BYTES:
                     file_to_send = compressed_file_path
                     was_compressed = True
                     logger.info(f"Compression successful: {comp_size / (1024*1024):.1f} MB")
@@ -434,15 +447,15 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         final_size = os.path.getsize(file_to_send)
         final_mb = final_size / (1024 * 1024)
 
-        if final_size > 50 * 1024 * 1024:
+        if final_size > MAX_TG_BYTES:
             from_user = session.get('from_user')
             if from_user:
                 sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Too Large ({final_mb:.1f} MB)")
             bot.edit_message_text(
                 f"⚠️ **File Too Large for Telegram**\n"
                 f"`{title}`\n\n"
-                f"Downloaded video is **{final_mb:.1f} MB** and could not be compressed under Telegram's 50 MB limit.\n"
-                f"Please try selecting a lower quality option (e.g. 360p or 480p).",
+                f"Downloaded video is **{final_mb:.1f} MB** and exceeds Telegram's {int(MAX_TG_MB)} MB limit.\n"
+                f"Please try selecting a lower quality option.",
                 chat_id=chat_id,
                 message_id=message_id,
                 parse_mode="Markdown"
@@ -457,17 +470,18 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             parse_mode="Markdown"
         )
 
-        caption_note = "\n_(Optimized for Telegram 50MB limit)_" if was_compressed else ""
+        caption_note = f"\n_(Optimized for Telegram {int(MAX_TG_MB)}MB limit)_" if was_compressed else ""
         caption_text = f"🎥 **{title}**{caption_note}\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com"
 
-        # Send video file
+        # Send video file (extended timeout for large files)
+        upload_timeout = 600 if IS_LOCAL_SERVER else 240
         with open(file_to_send, 'rb') as video:
             bot.send_video(
                 chat_id,
                 video,
                 caption=caption_text,
                 parse_mode="Markdown",
-                timeout=240
+                timeout=upload_timeout
             )
 
         # Log success

@@ -1,10 +1,31 @@
 services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram_bot_api_server
+    restart: always
+    environment:
+      TELEGRAM_API_ID: "18737790"
+      TELEGRAM_API_HASH: "5501420b428a05253494a609c4ba841b"
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./downloads:/app/downloads
+    ports:
+      - "8081:8081"
+
   video_downloader:
     build: .
     container_name: video_downloader
     restart: always
+    depends_on:
+      - telegram-bot-api
     environment:
       - GOOGLE_SPREADSHEET_ID=1JewhEUv237NZihRPc0bIXQUyT2cvHn71FvgNb0vWH7g
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
     volumes:
       - ./downloads:/app/downloads
       - ./google_credentials.json:/app/google_credentials.json:ro
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+
+volumes:
+  telegram-bot-api-data:
