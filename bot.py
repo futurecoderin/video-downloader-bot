@@ -116,28 +116,78 @@ FORMAT_OPTIONS = [
     {
         'key': 'q_best',
         'label': '🏆 Best Quality',
-        'ydl_format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        'ydl_format': 'bestvideo+bestaudio/best',
         'height': 9999,
     },
     {
         'key': 'q_720',
         'label': '📺 720p HD',
-        'ydl_format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        'ydl_format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'height': 720,
     },
     {
         'key': 'q_480',
         'label': '📱 480p',
-        'ydl_format': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best',
+        'ydl_format': 'bestvideo[height<=480]+bestaudio/best[height<=480]/best',
         'height': 480,
     },
     {
         'key': 'q_360',
         'label': '📷 360p',
-        'ydl_format': 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best',
+        'ydl_format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best',
         'height': 360,
     },
 ]
+
+def get_cookies_path():
+    """Find available cookies file for platforms requiring authentication."""
+    for candidate in [
+        os.path.join(script_dir, "cookies.txt"),
+        os.path.join(script_dir, "www.facebook.com_cookies.txt"),
+        "/app/cookies.txt"
+    ]:
+        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
+
+def get_video_dimensions(file_path):
+    """Get video width and height using ffprobe to preserve native aspect ratio."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            file_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        out = res.stdout.strip()
+        if "x" in out:
+            parts = out.split("\n")[0].split("x")
+            return int(parts[0]), int(parts[1])
+    except Exception as e:
+        logger.warning(f"Could not get video dimensions via ffprobe: {e}")
+    return None, None
+
+def generate_thumbnail(video_path):
+    """Generate a JPEG thumbnail matching video aspect ratio from the 1st second."""
+    base, _ = os.path.splitext(video_path)
+    thumb_path = f"{base}_thumb.jpg"
+    try:
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", "00:00:01",
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            thumb_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception as e:
+        logger.warning(f"Failed to generate thumbnail: {e}")
+    return None
 
 def get_video_duration(file_path):
     """Get video duration in seconds using ffprobe."""
@@ -156,7 +206,7 @@ def get_video_duration(file_path):
 
 def compress_video_to_limit(input_path, target_max_mb=47.5):
     """
-    Compress video with FFmpeg to ensure it is strictly below target_max_mb (Telegram Bot API 50MB limit).
+    Compress video with FFmpeg to ensure it is strictly below target_max_mb (Telegram Bot API limit).
     Returns path to compressed video if successful and within limits, otherwise None.
     """
     if not shutil.which("ffmpeg"):
@@ -187,7 +237,7 @@ def compress_video_to_limit(input_path, target_max_mb=47.5):
     base, _ = os.path.splitext(input_path)
     output_path = f"{base}_compressed.mp4"
 
-    # Scale video down if bitrate is low to maintain sharp visual quality
+    # Scale video down if bitrate is low to maintain sharp visual quality while keeping aspect ratio
     scale_filter = "scale='min(1280,iw)':-2"
     if video_bps < 300_000:
         scale_filter = "scale='min(640,iw)':-2"
@@ -242,6 +292,10 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
                 }
             },
         }
+        cookie_file = get_cookies_path()
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"Using cookies file: {cookie_file}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -404,6 +458,10 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
                 }
             },
         }
+        cookie_file = get_cookies_path()
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"Downloading using cookies file: {cookie_file}")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -473,16 +531,40 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         caption_note = f"\n_(Optimized for Telegram {int(MAX_TG_MB)}MB limit)_" if was_compressed else ""
         caption_text = f"🎥 **{title}**{caption_note}\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com"
 
+        # Determine video dimensions and duration to preserve native aspect ratio in Telegram player
+        width, height = get_video_dimensions(file_to_send)
+        duration_sec = int(get_video_duration(file_to_send))
+        thumb_path = generate_thumbnail(file_to_send)
+        logger.info(f"Sending video with dimensions: {width}x{height}, duration: {duration_sec}s, thumb: {bool(thumb_path)}")
+
         # Send video file (extended timeout for large files)
         upload_timeout = 600 if IS_LOCAL_SERVER else 240
-        with open(file_to_send, 'rb') as video:
-            bot.send_video(
-                chat_id,
-                video,
-                caption=caption_text,
-                parse_mode="Markdown",
-                timeout=upload_timeout
-            )
+        thumb_file = open(thumb_path, 'rb') if thumb_path and os.path.exists(thumb_path) else None
+        try:
+            with open(file_to_send, 'rb') as video:
+                bot.send_video(
+                    chat_id,
+                    video,
+                    caption=caption_text,
+                    parse_mode="Markdown",
+                    width=width,
+                    height=height,
+                    duration=duration_sec if duration_sec > 0 else None,
+                    supports_streaming=True,
+                    thumbnail=thumb_file,
+                    timeout=upload_timeout
+                )
+        finally:
+            if thumb_file:
+                try:
+                    thumb_file.close()
+                except Exception:
+                    pass
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                except Exception:
+                    pass
 
         # Log success
         from_user = session.get('from_user')
