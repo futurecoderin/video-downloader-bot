@@ -140,14 +140,19 @@ FORMAT_OPTIONS = [
 ]
 
 def get_cookies_path():
-    """Find available cookies file for platforms requiring authentication."""
+    """Find available cookies file and return a writable copy in /tmp for yt-dlp."""
     for candidate in [
         os.path.join(script_dir, "cookies.txt"),
         os.path.join(script_dir, "www.facebook.com_cookies.txt"),
         "/app/cookies.txt"
     ]:
         if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-            return candidate
+            tmp_cookie = "/tmp/cookies.txt"
+            try:
+                shutil.copyfile(candidate, tmp_cookie)
+                return tmp_cookie
+            except Exception:
+                return candidate
     return None
 
 def get_video_dimensions(file_path):

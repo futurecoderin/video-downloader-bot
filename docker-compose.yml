@@ -25,7 +25,7 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./google_credentials.json:/app/google_credentials.json:ro
-      - ./cookies.txt:/app/cookies.txt:ro
+      - ./cookies.txt:/app/cookies.txt
       - telegram-bot-api-data:/var/lib/telegram-bot-api
 
 volumes:
