@@ -139,15 +139,50 @@ FORMAT_OPTIONS = [
     },
 ]
 
-def get_cookies_path():
+def escape_markdown(text):
+    """Escape markdown special characters to prevent Telegram parse errors."""
+    if not text:
+        return ""
+    for ch in ['_', '*', '`', '[']:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+def get_cookies_path(url=None):
     """Find available cookies file and return a writable copy in /tmp for yt-dlp."""
-    for candidate in [
+    candidates = []
+
+    # 1. URL domain-specific cookies
+    if url:
+        url_lower = url.lower()
+        if "reddit.com" in url_lower:
+            candidates.extend([
+                os.path.join(script_dir, "www.reddit.com_cookies.txt"),
+                "/app/www.reddit.com_cookies.txt",
+                os.path.join(script_dir, "reddit_cookies.txt"),
+                "/app/reddit_cookies.txt"
+            ])
+        elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
+            candidates.extend([
+                os.path.join(script_dir, "www.facebook.com_cookies.txt"),
+                "/app/www.facebook.com_cookies.txt",
+                os.path.join(script_dir, "facebook_cookies.txt"),
+                "/app/facebook_cookies.txt"
+            ])
+        elif "instagram.com" in url_lower:
+            candidates.extend([
+                os.path.join(script_dir, "www.instagram.com_cookies.txt"),
+                "/app/www.instagram.com_cookies.txt"
+            ])
+
+    # 2. General/merged cookies fallback
+    candidates.extend([
         os.path.join(script_dir, "cookies.txt"),
-        os.path.join(script_dir, "www.facebook.com_cookies.txt"),
         "/app/cookies.txt"
-    ]:
-        if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-            tmp_cookie = "/tmp/cookies.txt"
+    ])
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+            tmp_cookie = f"/tmp/cookies_{os.path.basename(candidate)}"
             try:
                 shutil.copyfile(candidate, tmp_cookie)
                 return tmp_cookie
@@ -297,10 +332,10 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
                 }
             },
         }
-        cookie_file = get_cookies_path()
+        cookie_file = get_cookies_path(url)
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
-            logger.info(f"Using cookies file: {cookie_file}")
+            logger.info(f"Using cookies file: {cookie_file} for {url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -355,22 +390,31 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
             callback_data = f"dl:{session_id}:{opt['key']}"
             keyboard.add(InlineKeyboardButton(text=btn_text, callback_data=callback_data))
 
+        safe_title = title.replace('`', "'")
         duration_str = f"{int(duration//60)}m {int(duration%60)}s" if duration else "unknown"
         limit_desc = "up to 2 GB supported" if IS_LOCAL_SERVER else "auto-optimized under 50 MB"
         info_text = (
             f"🎬 **Video Found:**\n"
-            f"`{title}`\n"
+            f"`{safe_title}`\n"
             f"⏱ Duration: {duration_str}\n\n"
             f"Select quality to download:\n"
             f"_({limit_desc})_"
         )
-        bot.edit_message_text(
-            info_text,
-            chat_id=chat_id,
-            message_id=message_id,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                info_text,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            bot.edit_message_text(
+                f"🎬 Video Found:\n{safe_title}\n⏱ Duration: {duration_str}\n\nSelect quality to download:\n({limit_desc})",
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=keyboard
+            )
 
     except Exception as e:
         logger.error(f"Failed to analyze link {url}: {e}")
@@ -381,17 +425,34 @@ def analyze_video_link(chat_id, message_id, url, from_user=None):
                 "The hosting site (CDN) returned a **530 Origin Host Error**.\n"
                 "This means the video stream has been deleted, expired, or is broken on the source website's servers."
             )
+        elif "Account authentication is required" in err_str or ("login" in err_str.lower() and "required" in err_str.lower()):
+            err_msg = (
+                "❌ **Account Authentication Required**\n\n"
+                "This content (e.g. NSFW / age-gated Reddit post or private video) requires account authentication.\n"
+                "Please make sure valid cookies are configured."
+            )
         elif "Unsupported URL" in err_str:
             err_msg = "❌ **Unsupported Link:** This website or link type is currently not supported."
         else:
-            err_msg = f"❌ **Error:** Could not extract video information.\n\n*Details:* {err_str[:200]}"
+            safe_err = escape_markdown(err_str[:200])
+            err_msg = f"❌ **Error:** Could not extract video information.\n\n*Details:* {safe_err}"
 
-        bot.edit_message_text(
-            err_msg,
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                err_msg,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            try:
+                bot.edit_message_text(
+                    err_msg.replace("*", "").replace("`", "").replace("_", ""),
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            except Exception:
+                bot.send_message(chat_id, err_msg.replace("*", "").replace("`", "").replace("_", ""))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('dl:'))
 def handle_download_callback(call):
@@ -435,24 +496,37 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         bot.send_message(chat_id, "❌ Error: Selected format not found.")
         return
 
-    # Update message status
-    bot.edit_message_text(
-        f"⏳ **Downloading video...**\n`{title}`\n\nPlease wait a moment.",
-        chat_id=chat_id,
-        message_id=message_id,
-        parse_mode="Markdown"
-    )
+    # Update message status safely
+    safe_title = title.replace('`', "'")
+    try:
+        bot.edit_message_text(
+            f"⏳ **Downloading video...**\n`{safe_title}`\n\nPlease wait a moment.",
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode="Markdown"
+        )
+    except Exception:
+        try:
+            bot.edit_message_text(
+                f"⏳ Downloading video...\n{safe_title}\n\nPlease wait a moment.",
+                chat_id=chat_id,
+                message_id=message_id
+            )
+        except Exception:
+            pass
 
     downloaded_file_path = None
     compressed_file_path = None
     try:
-        output_template = os.path.join(downloads_dir, f"{session_id}_%(title)s.%(ext)s")
+        # Enforce filename length limit (ext4 255-byte limit) and restrict unsafe characters
+        output_template = os.path.join(downloads_dir, f"{session_id}_%(title).40B.%(ext)s")
         ydl_format = format_info.get('ydl_format', format_id)
         logger.info(f"Downloading format: {ydl_format} for {url}")
 
         ydl_opts = {
             'format': ydl_format,
             'outtmpl': output_template,
+            'restrictfilenames': True,
             'quiet': True,
             'no_warnings': True,
             'socket_timeout': 60,
@@ -463,17 +537,23 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
                 }
             },
         }
-        cookie_file = get_cookies_path()
+        cookie_file = get_cookies_path(url)
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
-            logger.info(f"Downloading using cookies file: {cookie_file}")
+            logger.info(f"Downloading using cookies file: {cookie_file} for {url}")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
         # Scan download folder for the downloaded file
         for filename in os.listdir(downloads_dir):
-            if filename.startswith(session_id) and not filename.endswith("_compressed.mp4"):
+            if (
+                filename.startswith(f"{session_id}_")
+                and not filename.endswith("_compressed.mp4")
+                and not filename.endswith(".part")
+                and not filename.endswith(".ytdl")
+                and not filename.endswith("_thumb.jpg")
+            ):
                 downloaded_file_path = os.path.join(downloads_dir, filename)
                 break
 
@@ -488,14 +568,17 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             size_mb = actual_size / (1024 * 1024)
             target_compress_mb = 1900.0 if IS_LOCAL_SERVER else 47.5
             logger.info(f"File is {size_mb:.1f} MB (>{MAX_TG_MB}MB). Initiating auto-compression to {target_compress_mb}MB...")
-            bot.edit_message_text(
-                f"🔄 **File is {size_mb:.1f} MB (exceeds Telegram {int(MAX_TG_MB)} MB limit).**\n"
-                f"`{title}`\n\n"
-                f"Compressing video to fit Telegram's limit... Please wait a moment.",
-                chat_id=chat_id,
-                message_id=message_id,
-                parse_mode="Markdown"
-            )
+            try:
+                bot.edit_message_text(
+                    f"🔄 **File is {size_mb:.1f} MB (exceeds Telegram {int(MAX_TG_MB)} MB limit).**\n"
+                    f"`{safe_title}`\n\n"
+                    f"Compressing video to fit Telegram's limit... Please wait a moment.",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
 
             compressed_file_path = compress_video_to_limit(downloaded_file_path, target_max_mb=target_compress_mb)
             if compressed_file_path and os.path.exists(compressed_file_path):
@@ -514,27 +597,37 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             from_user = session.get('from_user')
             if from_user:
                 sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Too Large ({final_mb:.1f} MB)")
+            try:
+                bot.edit_message_text(
+                    f"⚠️ **File Too Large for Telegram**\n"
+                    f"`{safe_title}`\n\n"
+                    f"Downloaded video is **{final_mb:.1f} MB** and exceeds Telegram's {int(MAX_TG_MB)} MB limit.\n"
+                    f"Please try selecting a lower quality option.",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ File Too Large for Telegram: {safe_title} ({final_mb:.1f} MB). Exceeds {int(MAX_TG_MB)} MB limit."
+                )
+            return
+
+        # Update status before sending
+        try:
             bot.edit_message_text(
-                f"⚠️ **File Too Large for Telegram**\n"
-                f"`{title}`\n\n"
-                f"Downloaded video is **{final_mb:.1f} MB** and exceeds Telegram's {int(MAX_TG_MB)} MB limit.\n"
-                f"Please try selecting a lower quality option.",
+                f"📤 **Uploading to Telegram...**\n`{safe_title}`\n_{final_mb:.1f} MB_",
                 chat_id=chat_id,
                 message_id=message_id,
                 parse_mode="Markdown"
             )
-            return
-
-        # Update status before sending
-        bot.edit_message_text(
-            f"📤 **Uploading to Telegram...**\n`{title}`\n_{final_mb:.1f} MB_",
-            chat_id=chat_id,
-            message_id=message_id,
-            parse_mode="Markdown"
-        )
+        except Exception:
+            pass
 
         caption_note = f"\n_(Optimized for Telegram {int(MAX_TG_MB)}MB limit)_" if was_compressed else ""
-        caption_text = f"🎥 **{title}**{caption_note}\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com"
+        caption_title = escape_markdown(title[:100])
+        caption_text = f"🎥 *{caption_title}*{caption_note}\n\nDownloaded via Video Downloader Bot\n🔗 abhishekvigyan.com"
 
         # Determine video dimensions and duration to preserve native aspect ratio in Telegram player
         width, height = get_video_dimensions(file_to_send)
@@ -547,18 +640,36 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
         thumb_file = open(thumb_path, 'rb') if thumb_path and os.path.exists(thumb_path) else None
         try:
             with open(file_to_send, 'rb') as video:
-                bot.send_video(
-                    chat_id,
-                    video,
-                    caption=caption_text,
-                    parse_mode="Markdown",
-                    width=width,
-                    height=height,
-                    duration=duration_sec if duration_sec > 0 else None,
-                    supports_streaming=True,
-                    thumbnail=thumb_file,
-                    timeout=upload_timeout
-                )
+                try:
+                    bot.send_video(
+                        chat_id,
+                        video,
+                        caption=caption_text,
+                        parse_mode="Markdown",
+                        width=width,
+                        height=height,
+                        duration=duration_sec if duration_sec > 0 else None,
+                        supports_streaming=True,
+                        thumbnail=thumb_file,
+                        timeout=upload_timeout
+                    )
+                except telebot.apihelper.ApiTelegramException as te:
+                    if "can't parse entities" in str(te).lower():
+                        # Retry without markdown if markdown parsing failed
+                        video.seek(0)
+                        bot.send_video(
+                            chat_id,
+                            video,
+                            caption=caption_text.replace("*", "").replace("`", "").replace("_", ""),
+                            width=width,
+                            height=height,
+                            duration=duration_sec if duration_sec > 0 else None,
+                            supports_streaming=True,
+                            thumbnail=thumb_file,
+                            timeout=upload_timeout
+                        )
+                    else:
+                        raise te
         finally:
             if thumb_file:
                 try:
@@ -577,18 +688,35 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
             sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Success ({final_mb:.1f} MB)")
 
         # Delete the original status message
-        bot.delete_message(chat_id, message_id)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error(f"Download failed: {e}")
         from_user = session.get('from_user') if session else None
         if from_user:
             sheets_logger.log_video_downloader(from_user, "Download", format_id, f"Failed: {str(e)[:80]}")
-        bot.send_message(
-            chat_id,
-            f"❌ **Failed to download video.**\n\n*Error:* {str(e)[:150]}...",
-            parse_mode="Markdown"
-        )
+        
+        safe_err = escape_markdown(str(e)[:150])
+        err_msg = f"❌ **Failed to download video.**\n\n*Error:* {safe_err}..."
+        try:
+            bot.edit_message_text(
+                err_msg,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            try:
+                bot.edit_message_text(
+                    err_msg.replace("*", "").replace("`", "").replace("_", ""),
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            except Exception:
+                bot.send_message(chat_id, err_msg.replace("*", "").replace("`", "").replace("_", ""))
     finally:
         # Cleanup files from disk
         for fpath in [downloaded_file_path, compressed_file_path]:
@@ -598,6 +726,17 @@ def download_and_send_video(chat_id, message_id, session_id, format_id):
                 except Exception as ex:
                     logger.error(f"Failed to delete file {fpath}: {ex}")
         
+        # Cleanup any orphaned files for this session
+        try:
+            for f in os.listdir(downloads_dir):
+                if f.startswith(f"{session_id}_"):
+                    try:
+                        os.remove(os.path.join(downloads_dir, f))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         # Remove session to free memory
         if session_id in download_sessions:
             del download_sessions[session_id]

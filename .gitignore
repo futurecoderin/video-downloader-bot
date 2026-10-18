@@ -5,3 +5,4 @@ env.txt
 .env
 *.pyc
 google_credentials.json
+*cookies*.txt
